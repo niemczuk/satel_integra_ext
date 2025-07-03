@@ -213,6 +213,7 @@ class AsyncSatel:
         self.partition_states = {}
         self._keep_alive_timeout = 20
         self._reconnection_timeout = 15
+        self._timeout_count = 0
         self._reader = None
         self._writer = None
         self.closed = False
@@ -274,6 +275,13 @@ class AsyncSatel:
             return False
 
         return True
+
+    def _force_disconnect(self):
+        if self._writer:
+            self._writer.close()
+        self._writer = None
+        self._reader = None
+        self._command_queue.clear()
 
     def _zone_violated(self, msg):
 
@@ -344,6 +352,7 @@ class AsyncSatel:
 
         if not self._writer:
             _LOGGER.warning("Ignoring data because we're disconnected!")
+            return False
         try:
             self._writer.write(data)
             await self._writer.drain()
@@ -382,13 +391,21 @@ class AsyncSatel:
                 if await self._send_frame(frame):
                     await asyncio.wait_for(asyncio.shield(self._command_status_event.wait()), timeout=10)
                     self._command_status_event.clear()
+                    self._timeout_count = 0
                 self._command_queue.task_done()
             except TimeoutError:
                 self._command_queue.task_done()
-                _LOGGER.warning("Timeout while waiting for confirmation")
-            except Exception:
+                self._timeout_count += 1
+                _LOGGER.warning("Timeout while waiting for confirmation (timeout count: %d)", self._timeout_count)
+                if self._timeout_count >= 3:
+                    _LOGGER.error("Too many timeouts, forcing reconnect")
+                    self._force_disconnect()
+                    self._timeout_count = 0
+            except Exception as e:
                 self._command_queue.task_done()
-                _LOGGER.warning("Error while waiting for confirmation")
+                _LOGGER.warning("Error while waiting for confirmation: %s", e)
+                self._force_disconnect()
+                self._timeout_count = 0
 
     async def start_monitoring(self):
         """Start monitoring for interesting events."""
@@ -469,7 +486,10 @@ class AsyncSatel:
             if msg.cmd in self._message_handlers:
                 _LOGGER.debug("Calling handlers for %s", msg.cmd)
                 for handler in self._message_handlers[msg.cmd]:
-                    handler(msg)
+                    try:
+                        handler(msg)
+                    except Exception as e:
+                        _LOGGER.error("Handler for %s raised exception: %s", msg.cmd, e)
             else:
                 _LOGGER.info("Skipping command: %s", msg.cmd)
 
@@ -488,25 +508,30 @@ class AsyncSatel:
         _LOGGER.info("Starting monitor_status loop")
 
         while not self.closed:
-            while not self.connected:
-                _LOGGER.info("Not connected, re-connecting... ")
-                await self.connect()
+            try:
+                while not self.connected:
+                    _LOGGER.info("Not connected, re-connecting... ")
+                    await self.connect()
+                    if not self.connected:
+                        _LOGGER.warning("Not connected, sleeping for 10s... ")
+                        await asyncio.sleep(self._reconnection_timeout)
+                        continue
+                await self.start_monitoring()
                 if not self.connected:
-                    _LOGGER.warning("Not connected, sleeping for 10s... ")
+                    _LOGGER.warning("Start monitoring failed, sleeping for 10s...")
                     await asyncio.sleep(self._reconnection_timeout)
                     continue
-            await self.start_monitoring()
-            if not self.connected:
-                _LOGGER.warning("Start monitoring failed, sleeping for 10s...")
+                while True:
+                    frame = await self._read_frame()
+                    self._dispatch_frame(frame)
+                    if not self.connected:
+                        _LOGGER.info("Got connection broken, reconnecting!")
+                        break
+            except Exception as e:
+                _LOGGER.error("Monitor loop crashed with exception: %s", e)
+                self._force_disconnect()
                 await asyncio.sleep(self._reconnection_timeout)
-                continue
-            while True:
-                frame = await self._read_frame()
-                self._dispatch_frame(frame)
-                if not self.connected:
-                    _LOGGER.info("Got connection broken, reconnecting!")
-                    break
-        _LOGGER.info("Closed, quit monitoring.")
+            _LOGGER.info("Closed, quit monitoring.")
 
     def close(self):
         """Stop monitoring and close connection."""
@@ -531,17 +556,25 @@ class AsyncSatel:
 
         def err_callback(msg):
             if msg.msg_data[0] != 0x00 and msg.msg_data[0] != 0xFF:
-                future.set_exception(Exception("Got error: %s" % msg.msg_data))
+                if not future.done():
+                    future.set_exception(Exception("Got error: %s" % msg.msg_data))
+                else:
+                    _LOGGER.warning("Future already completed, ignoring error callback: %s", msg.msg_data)
+
 
         def callback(msg):
             result = message_handler(msg)
             if result is not None:
-                future.set_result(result)
+                if not future.done():
+                    future.set_result(result)
+                else:
+                    _LOGGER.warning("Future already completed, ignoring result callback: %s", result)
+
 
         try:
             self.add_handler(response_cmd, callback)
             self.add_handler(SatelCommand.RESULT, err_callback)
-            return await asyncio.wait_for(future, 2.6)
+            return await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError:
             raise TimeoutError("Timeout while waiting for response command %s" % response_cmd)
         finally:
